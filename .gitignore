@@ -13,3 +13,10 @@ generate_flamegraph.sh
 .vscode/
 .idea/
 .DS_Store
+
+PROJECT_ROADMAP.md
+PROJECT_ANALYSIS.md
+setup_git.sh
+sync_to_github.sh
+solution/
+PERF_FLAMEGRAPH_GUIDE.md
