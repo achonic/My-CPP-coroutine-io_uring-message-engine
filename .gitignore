@@ -1,0 +1,15 @@
+build/
+bin/
+*.o
+*.a
+*.so
+perf.data
+perf.data.old
+perf.unfold
+perf.folded
+perf.svg
+FlameGraph/
+generate_flamegraph.sh
+.vscode/
+.idea/
+.DS_Store
