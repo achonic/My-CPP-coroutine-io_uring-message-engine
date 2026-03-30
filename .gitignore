@@ -20,3 +20,5 @@ setup_git.sh
 sync_to_github.sh
 solution/
 PERF_FLAMEGRAPH_GUIDE.md
+cachegrind.out.*
+cg*

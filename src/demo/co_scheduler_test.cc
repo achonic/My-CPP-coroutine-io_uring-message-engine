@@ -8,10 +8,11 @@
 #include "../include/scheduler.hpp"
 #include "../include/task.hpp"
 
-constexpr int NUM_PRODUCERS = 4;           // 模拟 4 个并发生产者
-constexpr int TASKS_PER_PRODUCER = 250000; // 每个生产者投递 25 万个任务
+constexpr int NUM_PRODUCERS = 4; // 模拟 4 个并发生产者
+constexpr int TASKS_PER_PRODUCER =
+    2500000; // 每个生产者投递 250 万个任务 (总 1000 万)
 constexpr int TOTAL_TASKS =
-    NUM_PRODUCERS * TASKS_PER_PRODUCER; // 总计 100 万任务
+    NUM_PRODUCERS * TASKS_PER_PRODUCER; // 总计 1000 万任务
 
 // 全局原子计数器，用于主线程校验所有任务是否执行完毕
 std::atomic<int> completed_tasks{0};
@@ -96,7 +97,7 @@ int main() {
   auto end_time = std::chrono::high_resolution_clock::now();
   std::chrono::duration<double, std::milli> elapsed = end_time - start_time;
 
-  ASYNC_LOG() << "[Photon-Ring Core] 引擎运行完毕！\n";
+  ASYNC_LOG() << "[message] 引擎运行完毕！\n";
   ASYNC_LOG() << "总计处理任务: " << TOTAL_TASKS << "\n";
   ASYNC_LOG() << "总耗时: " << elapsed.count() << " ms\n";
   ASYNC_LOG() << "吞吐量 (OPS): " << (TOTAL_TASKS / (elapsed.count() / 1000.0))

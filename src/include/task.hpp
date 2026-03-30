@@ -1,9 +1,10 @@
 #pragma once
 #include <coroutine>
-#include <exception>
-#include <new> // 用于 placement new 和内存池
+#include <memory_pool.hpp>
 #include <stdexcept>
 #include <utility>
+
+// #include <new> // 用于 placement new 和内存池
 
 template <typename T> class Task {
 public:
@@ -15,16 +16,13 @@ public:
     // 记住“是谁在等待我完成”。当本协程执行完毕后，需要唤醒这个 continuation_。
     std::coroutine_handle<> continuation_ = nullptr;
 
-    // --- 内存池 Hook 预留（应对高频分配） ---
-    // 在像 Photon-Ring
-    // 这样追求极致吞吐的高并发消息引擎中，这里的拦截是接入无锁内存池的绝佳切入点。
+    // --- 内存池 Hook 预留 ---
+    // 通过内存池分配，减少系统调用次数和指令数。
     void *operator new(std::size_t size) {
-      // TODO: 后续可替换为 MemoryPool::allocate(size)
-      return ::operator new(size);
+      return pool_allocate(size);
     }
     void operator delete(void *ptr, std::size_t size) {
-      // TODO: 后续可替换为 MemoryPool::deallocate(ptr, size)
-      ::operator delete(ptr);
+      pool_deallocate(ptr, size);
     }
 
     Task get_return_object() {
