@@ -60,10 +60,10 @@ class CoroutineMemoryPool {
     void *memory;
   };
 
-  static constexpr std::size_t BLOCK_SIZE = 72; // 72B frame + 8B 对齐 padding
-  static constexpr std::size_t SLAB_SIZE = 4 << 20; // 4MB
+  static constexpr std::size_t BLOCK_BYTES = 72; // 72B frame + 8B 对齐 padding
+  static constexpr std::size_t SLAB_BYTES = 4 << 20; // 4MB
   static constexpr std::size_t BLOCKS_PER_SLAB =
-      SLAB_SIZE / BLOCK_SIZE; // 32768
+      SLAB_BYTES / BLOCK_BYTES; // 32768
   static constexpr std::size_t REFILL_BATCH = 4096;
 
   SpinLock lock_;
@@ -71,14 +71,14 @@ class CoroutineMemoryPool {
   std::vector<Slab> slabs_;
 
   void grow_locked() {
-    void *raw = std::aligned_alloc(64, SLAB_SIZE);
+    void *raw = std::aligned_alloc(64, SLAB_BYTES);
     if (!raw)
       throw std::bad_alloc();
     slabs_.push_back({raw});
 
     char *ptr = static_cast<char *>(raw);
     for (std::size_t i = 0; i < BLOCKS_PER_SLAB; ++i) {
-      auto *block = reinterpret_cast<PoolFreeBlock *>(ptr + i * BLOCK_SIZE);
+      auto *block = reinterpret_cast<PoolFreeBlock *>(ptr + i * BLOCK_BYTES);
       block->next = global_free_;
       global_free_ = block;
     }
@@ -108,7 +108,7 @@ public:
       std::free(s.memory);
   }
 
-  static constexpr std::size_t block_size() { return BLOCK_SIZE; }
+  static constexpr std::size_t block_size() { return BLOCK_BYTES; }
   static constexpr std::size_t refill_batch() { return REFILL_BATCH; }
 
   PoolFreeBlock *refill(std::size_t count) {

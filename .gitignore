@@ -22,3 +22,5 @@ solution/
 PERF_FLAMEGRAPH_GUIDE.md
 cachegrind.out.*
 cg*
+IO_URING_PLAN.md
+docs/

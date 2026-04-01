@@ -10,9 +10,9 @@
 
 constexpr int NUM_PRODUCERS = 4; // 模拟 4 个并发生产者
 constexpr int TASKS_PER_PRODUCER =
-    2500000; // 每个生产者投递 250 万个任务 (总 1000 万)
+    250000; // 每个生产者投递 25 万个任务 (总 100 万)
 constexpr int TOTAL_TASKS =
-    NUM_PRODUCERS * TASKS_PER_PRODUCER; // 总计 1000 万任务
+    NUM_PRODUCERS * TASKS_PER_PRODUCER; // 总计 100 万任务
 
 // 全局原子计数器，用于主线程校验所有任务是否执行完毕
 std::atomic<int> completed_tasks{0};

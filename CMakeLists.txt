@@ -15,12 +15,19 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -fno-omit-frame-pointe
 # Include directories
 include_directories(src/include)
 
-# Find Threads
+# Find Threads and liburing
 find_package(Threads REQUIRED)
+find_library(LIBURING uring REQUIRED)
 
 # Targets
 add_executable(dag_test src/demo/dag_test.cc)
-target_link_libraries(dag_test PRIVATE Threads::Threads)
+target_link_libraries(dag_test PRIVATE Threads::Threads ${LIBURING})
 
 add_executable(co_scheduler_test src/demo/co_scheduler_test.cc)
-target_link_libraries(co_scheduler_test PRIVATE Threads::Threads)
+target_link_libraries(co_scheduler_test PRIVATE Threads::Threads ${LIBURING})
+
+add_executable(io_context_test src/demo/io_context_test.cc)
+target_link_libraries(io_context_test PRIVATE Threads::Threads ${LIBURING})
+
+add_executable(io_awaiter_test src/demo/io_awaiter_test.cc)
+target_link_libraries(io_awaiter_test PRIVATE Threads::Threads ${LIBURING})
