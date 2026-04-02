@@ -40,7 +40,7 @@ struct IoAwaiter {
     handle_ = handle;
     struct io_uring_sqe *sqe = ctx_.get_sqe();
 
-    // 根据 opcode 初始化不同的 IO 操作
+    // 根据 opcode 初始化不同的 IO 操作( read/write/accpet )
     if (opcode_ == IORING_OP_READ) {
       io_uring_prep_read(sqe, fd_, buf_, len_, offset_);
     } else if (opcode_ == IORING_OP_WRITE) {
@@ -48,14 +48,18 @@ struct IoAwaiter {
     } else if (opcode_ == IORING_OP_ACCEPT) {
       io_uring_prep_accept(sqe, fd_, (struct sockaddr *)buf_, (socklen_t *)len_,
                            offset_);
+    } else if (opcode_ == IORING_OP_RECV) {
+      io_uring_prep_recv(sqe, fd_, buf_, len_, 0);
+    } else if (opcode_ == IORING_OP_SEND) {
+      io_uring_prep_send(sqe, fd_, buf_, len_, 0);
     }
 
     // 【关键】：将 Awaiter 实例指针存入 user_data
     // 因为 Awaiter 存在于协程栈帧中，其生命周期在协程挂起期间是安全的
     io_uring_sqe_set_data(sqe, this);
 
-    // 提交任务
-    ctx_.submit();
+    // 提交任务交由调度器统一批处理 (任务 3.4)
+    // ctx_.submit();
   }
 
   // 被唤醒后，返回 IO 操作的结果（如读写的字节数）
@@ -80,4 +84,12 @@ inline auto AsyncAccept(IoContext &ctx, int fd, struct sockaddr *addr,
                         socklen_t *addrlen) {
   // offset 参数在 accept 中对应 flags
   return IoAwaiter(ctx, fd, addr, (size_t)addrlen, 0, IORING_OP_ACCEPT);
+}
+
+inline auto AsyncRecv(IoContext &ctx, int fd, void *buf, size_t len) {
+  return IoAwaiter(ctx, fd, buf, len, 0, IORING_OP_RECV);
+}
+
+inline auto AsyncSend(IoContext &ctx, int fd, const void *buf, size_t len) {
+  return IoAwaiter(ctx, fd, const_cast<void *>(buf), len, 0, IORING_OP_SEND);
 }

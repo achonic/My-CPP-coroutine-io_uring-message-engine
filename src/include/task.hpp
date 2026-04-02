@@ -18,17 +18,19 @@ public:
 
     // --- 内存池 Hook 预留 ---
     // 通过内存池分配，减少系统调用次数和指令数。
-    void *operator new(std::size_t size) {
-      return pool_allocate(size);
-    }
+    void *operator new(std::size_t size) { return pool_allocate(size); }
     void operator delete(void *ptr, std::size_t size) {
       pool_deallocate(ptr, size);
     }
 
+    // 协程构造完成后，调用此函数，返回 Task 对象（由编译器自动调用）
+    // 拿到只有编译器知道的 promise_type 句柄
     Task get_return_object() {
       return Task{std::coroutine_handle<promise_type>::from_promise(*this)};
     }
 
+    // 协程开始执行前，调用此函数
+    // 返回 suspend_always 表示协程一创建就挂起，等待第一次 resume
     std::suspend_always initial_suspend() noexcept { return {}; }
 
     // 【核心改造】：final_suspend 与对称传输

@@ -1,6 +1,8 @@
 #pragma once
 #include "mpsc_queue.hpp" // 替换为战役一的连续内存无锁队列
 #include "task.hpp"
+#include "io_context.hpp"
+#include "io_awaiter.hpp"
 #include <algorithm>
 #include <atomic>
 #include <thread>
@@ -23,6 +25,9 @@ private:
   // 【核心引擎】：使用我们战役一打造的连续内存无锁 RingBuffer
   // 注意：容量必须是 2 的幂次方！(例如 1024, 65536)
   RingBufferMPSC<Task<int>> queue_;
+
+  // io_uring 上下文，调度器的唯一 IO 引擎
+  IoContext io_context_;
 
   // 控制调度器启停的原子开关，对齐缓存行防止伪共享
   alignas(64) std::atomic<bool> running_{false};
@@ -47,10 +52,14 @@ public:
   // 初始化时指定环形队列的容量，强制 2 的幂次方对齐
   // worker_cpu_id: 将 Worker 绑定到哪个物理核心（-1 = 不绑核，交给 OS）
   explicit CoroutineScheduler(size_t queue_capacity = 65536,
-                              int worker_cpu_id = -1)
-      : queue_(queue_capacity), worker_cpu_id_(worker_cpu_id) {}
+                              int worker_cpu_id = -1,
+                              unsigned int io_uring_entries = 1024)
+      : queue_(queue_capacity), io_context_(io_uring_entries), worker_cpu_id_(worker_cpu_id) {}
 
   ~CoroutineScheduler() { stop(); }
+
+  // 暴露 IoContext，供 IoAwaiter 提交任务时使用
+  IoContext& get_io_context() { return io_context_; }
 
   void start() {
     // 使用 release 语义，确保在此之前的初始化操作对 worker 线程可见
@@ -118,6 +127,27 @@ private:
           // current_task 此时持有 handle 并在本轮迭代末尾析构
         }
       } else {
+        // 尝试从 io_uring 收割完成的 IO 事件 (策略 A & 任务 3.3)
+        struct io_uring_cqe *cqe;
+        bool has_io = false;
+        while (io_context_.peek_cqe(&cqe) == 0) {
+          has_io = true;
+          IoAwaiter *awaiter =
+              static_cast<IoAwaiter *>(io_uring_cqe_get_data(cqe));
+          if (awaiter) {
+            awaiter->result_ = cqe->res;
+            io_context_.cqe_seen(cqe);
+            awaiter->handle_.resume();
+          } else {
+            io_context_.cqe_seen(cqe);
+          }
+        }
+
+        if (has_io) {
+          idle_spin_count = 0;
+          continue; // 只要有 IO 完成，就认为系统在忙碌，继续下一轮循环
+        }
+
         // 没有任务就自增空转计数
         // 【关键改造】：自适应退避策略 (Exponential Backoff)
         // 遇到真空期，绝对不能调用 yield() 陷入内核态！
@@ -137,12 +167,22 @@ private:
 #endif
           }
         } else {
-          // 阶段
-          // 3：真正的真空期。只有在长时间没有任务时，才极其吝啬地让出时间片。
-          // 此时系统处于绝对空闲，让出 CPU 给网络 I/O 轮询线程是合理的。
-          std::this_thread::yield();
-          // 在纯粹的极速场景中，哪怕到了这里也只用 _mm_pause，宁可 CPU 100%
-          // 空转。
+          // 阶段 3：真正的真空期。既没有计算任务，也没有立即可收割的 IO。
+          // 此时调用阻塞的 io_context.wait_cqe 沉睡，让出核心。
+          io_context_.submit(); // 阻塞前确保提交所有堆积的 IO 请求 (任务 3.4 准备)
+          
+          if (io_context_.wait_cqe(&cqe) == 0) {
+            IoAwaiter *awaiter =
+                static_cast<IoAwaiter *>(io_uring_cqe_get_data(cqe));
+            if (awaiter) {
+              awaiter->result_ = cqe->res;
+              io_context_.cqe_seen(cqe);
+              awaiter->handle_.resume();
+            } else {
+              io_context_.cqe_seen(cqe);
+            }
+            idle_spin_count = 0;
+          }
         }
       }
     }

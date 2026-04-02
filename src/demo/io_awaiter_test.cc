@@ -45,11 +45,15 @@ int main() {
     // 调用 promise.get_return_object()。
     // 这个调用会创建 Task<int> 对象。
     // 进入协程体，立刻遇到 co_await promise.initial_suspend()。
+    // 由于 initial_suspend 返回 suspend_always，所以协程立即挂起
     auto t = test_async_read(ctx, fd_read);
     // 第一次 resume，执行到 co_await AsyncRead(...)
+    // 调用 AsyncRead 的 await_suspend 方法
     t.resume();
 
-    std::cout << "[Main] Waiting for CQE..." << std::endl;
+    std::cout << "[Main] Submitting and Waiting for CQE..." << std::endl;
+    ctx.submit(); // 【关键修复】：由于 IoAwaiter 不再自动 submit，这里需要手动提交
+
     struct io_uring_cqe *cqe;
     int ret = ctx.wait_cqe(&cqe);
     if (ret == 0) {
@@ -59,8 +63,11 @@ int main() {
       // 填回结果
       awaiter->result_ = cqe->res;
 
-      std::cout << "[Main] IO Completed, res: " << cqe->res << std::endl;
+      char *data = static_cast<char *>(awaiter->buf_);
+      data[awaiter->result_] = '\0';
 
+      std::cout << "[Main] IO Completed, res: " << cqe->res << std::endl;
+      std::cout << "[Main] Data: " << data << std::endl;
       // 唤醒协程
       awaiter->handle_.resume();
 
