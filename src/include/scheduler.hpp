@@ -122,10 +122,11 @@ private:
         if (current_task.resume()) {
           // 如果协程挂起（未结束），将其移交给 active_tasks 维持生命周期
           active_tasks.push_back(std::move(current_task));
-        } else {
-          // 协程已经结束，可以安全销毁
-          // current_task 此时持有 handle 并在本轮迭代末尾析构
         }
+
+        // 重要：在处理完业务协程逻辑后，如果有新的 IO SQE 被填充，在这里 flush 进内核
+        io_context_.submit();
+
       } else {
         // 尝试从 io_uring 收割完成的 IO 事件 (策略 A & 任务 3.3)
         struct io_uring_cqe *cqe;
@@ -145,6 +146,7 @@ private:
 
         if (has_io) {
           idle_spin_count = 0;
+          io_context_.submit(); // 确保刚产生的新 IO 进入内核
           continue; // 只要有 IO 完成，就认为系统在忙碌，继续下一轮循环
         }
 

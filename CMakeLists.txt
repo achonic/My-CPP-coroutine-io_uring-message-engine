@@ -28,6 +28,15 @@ else()
   message(STATUS "Google Benchmark found. Building benchmark targets...")
   add_executable(mpsc_bench benchmark/mpsc_bench.cc)
   target_link_libraries(mpsc_bench PRIVATE Threads::Threads benchmark::benchmark src_headers)
+
+  add_executable(coroutine_bench benchmark/coroutine_bench.cc)
+  target_link_libraries(coroutine_bench PRIVATE Threads::Threads benchmark::benchmark src_headers)
+
+  add_executable(asio_echo_server benchmark/asio_echo_server.cc)
+  target_link_libraries(asio_echo_server PRIVATE Threads::Threads src_headers)
+
+  add_executable(echo_client_bench benchmark/echo_client_bench.cc)
+  target_link_libraries(echo_client_bench PRIVATE Threads::Threads benchmark::benchmark src_headers)
 endif()
 
 # 为了让编译更整洁，建议将 include_directories 抽取为 interface target

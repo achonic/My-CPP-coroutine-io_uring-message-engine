@@ -4,6 +4,7 @@
 #include <mutex>
 #include <queue>
 #include <thread>
+#include <boost/lockfree/queue.hpp>
 
 /**
  * @brief 测试对照组：标准互斥锁队列
@@ -100,5 +101,38 @@ static void BM_Mutex_Throughput(benchmark::State &state) {
   }
 }
 BENCHMARK(BM_Mutex_Throughput)->Threads(4);
+
+/**
+ * 对照组：Boost Lockfree Queue (MPMC)
+ */
+static void BM_BoostLockFree_Throughput(benchmark::State &state) {
+  static boost::lockfree::queue<DummyTask> queue(1048576);
+  static std::atomic<bool> producer_running{true};
+  static std::thread consumer;
+
+  if (state.thread_index() == 0) {
+    producer_running = true;
+    consumer = std::thread([]() {
+      DummyTask task;
+      while (producer_running) {
+        queue.pop(task);
+      }
+    });
+  }
+
+  DummyTask task{1, ""};
+  for (auto _ : state) {
+    while (!queue.push(task)) {
+      __builtin_ia32_pause();
+    }
+  }
+
+  if (state.thread_index() == 0) {
+    producer_running = false;
+    if (consumer.joinable())
+      consumer.join();
+  }
+}
+BENCHMARK(BM_BoostLockFree_Throughput)->Threads(4);
 
 BENCHMARK_MAIN();

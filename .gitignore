@@ -24,4 +24,6 @@ cachegrind.out.*
 cg*
 IO_URING_PLAN.md
 docs/
+bench_docs/
 BENCHMARK_PROGRESS.md
+run_bench.sh
