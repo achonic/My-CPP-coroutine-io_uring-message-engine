@@ -1,10 +1,10 @@
 #include "mpsc_queue.hpp"
 #include <atomic>
 #include <benchmark/benchmark.h>
+#include <boost/lockfree/queue.hpp>
 #include <mutex>
 #include <queue>
 #include <thread>
-#include <boost/lockfree/queue.hpp>
 
 /**
  * @brief 测试对照组：标准互斥锁队列
@@ -107,6 +107,7 @@ BENCHMARK(BM_Mutex_Throughput)->Threads(4);
  */
 static void BM_BoostLockFree_Throughput(benchmark::State &state) {
   static boost::lockfree::queue<DummyTask> queue(1048576);
+
   static std::atomic<bool> producer_running{true};
   static std::thread consumer;
 

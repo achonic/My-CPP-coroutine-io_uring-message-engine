@@ -60,7 +60,7 @@ class CoroutineMemoryPool {
     void *memory;
   };
 
-  static constexpr std::size_t BLOCK_BYTES = 72; // 72B frame + 8B 对齐 padding
+  static constexpr std::size_t BLOCK_BYTES = 128; // 覆盖常见协程帧(56~112B)，2×cache line 对齐
   static constexpr std::size_t SLAB_BYTES = 4 << 20; // 4MB
   static constexpr std::size_t BLOCKS_PER_SLAB =
       SLAB_BYTES / BLOCK_BYTES; // 32768

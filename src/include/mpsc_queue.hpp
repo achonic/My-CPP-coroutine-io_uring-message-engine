@@ -14,7 +14,7 @@ template <typename T> class RingBufferMPSC {
 private:
   // 槽位结构体：将数据和其生命周期状态绑定
   // 对齐到缓存行大小，防止相邻的槽位在多核并发读写时产生伪共享
-  struct alignas(hardware_destructive_interference_size) Slot {
+  struct alignas(64) Slot {
     T data;
     // 标记这个槽位是否已经被生产者写入完毕（Commit 阶段）
     std::atomic<bool> ready{false};
@@ -24,10 +24,10 @@ private:
   std::vector<Slot> buffer_;
 
   // 生产者游标：供多个生产者并发抢占
-  alignas(hardware_destructive_interference_size) std::atomic<size_t> head_{0};
+  alignas(64) std::atomic<size_t> head_{0};
 
   // 消费者游标：仅单线程访问，无需原子变量，但必须隔离缓存行
-  alignas(hardware_destructive_interference_size) size_t tail_{0};
+  alignas(64) size_t tail_{0};
 
 public:
   // 队列容量必须是 2 的幂次方，以便使用 & 操作符替代 %
@@ -44,15 +44,16 @@ public:
    */
   bool try_push(T value) {
     size_t write_idx = head_.load(std::memory_order_relaxed);
-    
+
     // 检查是否可能已满（粗略检查，为了性能不加锁）
     if (write_idx - tail_ >= capacity_mask_ + 1) {
-        return false; 
+      return false;
     }
 
     // 尝试抢占下标
-    if (!head_.compare_exchange_weak(write_idx, write_idx + 1, std::memory_order_relaxed)) {
-        return false; // 被其他生产者抢先了
+    if (!head_.compare_exchange_weak(write_idx, write_idx + 1,
+                                     std::memory_order_relaxed)) {
+      return false; // 被其他生产者抢先了
     }
 
     size_t pos = write_idx & capacity_mask_;
@@ -60,11 +61,12 @@ public:
 
     // 二次检查槽位是否真正就绪
     if (slot.ready.load(std::memory_order_acquire)) {
-        // 虽然下标抢到了，但消费者还没处理完这个槽位（极端高负载）
-        // 只能回退下标（这在 MPSC 中比较复杂，简单处理：让生产者自旋一下或者直接返回失败）
-        // 为了 Benchmark 的单线程测试不卡死，这里我们如果发现未就绪就返回失败
-        head_.fetch_sub(1, std::memory_order_relaxed);
-        return false;
+      // 虽然下标抢到了，但消费者还没处理完这个槽位（极端高负载）
+      // 只能回退下标（这在 MPSC
+      // 中比较复杂，简单处理：让生产者自旋一下或者直接返回失败） 为了 Benchmark
+      // 的单线程测试不卡死，这里我们如果发现未就绪就返回失败
+      head_.fetch_sub(1, std::memory_order_relaxed);
+      return false;
     }
 
     slot.data = std::move(value);

@@ -36,6 +36,7 @@ struct IoAwaiter {
   bool await_ready() const noexcept { return false; }
 
   // 核心逻辑：将当前 Awaiter 实例绑定到 SQE，并提交给内核
+  // std::coroutine_handle<> handle 传入的是外部协程的句柄
   void await_suspend(std::coroutine_handle<> handle) noexcept {
     handle_ = handle;
     struct io_uring_sqe *sqe = ctx_.get_sqe();

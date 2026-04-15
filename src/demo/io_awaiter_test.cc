@@ -5,7 +5,7 @@
 #include <iostream>
 
 /**
- * @brief 测试协程：演示如何使用 AsyncRead
+ * @brief 测试协程：演示如何使用 AsyncRead 进行协程异步读操作
  */
 Task<int> test_async_read(IoContext &ctx, int fd) {
   char buffer[128] = {0};
@@ -52,8 +52,12 @@ int main() {
     t.resume();
 
     std::cout << "[Main] Submitting and Waiting for CQE..." << std::endl;
-    ctx.submit(); // 【关键修复】：由于 IoAwaiter 不再自动 submit，这里需要手动提交
 
+    // 前面通过 AsyncRead 初始化了 io_uring 任务，但是没有提交到内核
+    // 必须手动调用 submit() 将任务提交到内核
+    ctx.submit();
+
+    // 完成队列，等待 io_uring 任务完成
     struct io_uring_cqe *cqe;
     int ret = ctx.wait_cqe(&cqe);
     if (ret == 0) {
