@@ -1,10 +1,11 @@
 #pragma once
+#include "io_awaiter.hpp"
+#include "io_context.hpp"
 #include "mpsc_queue.hpp" // 替换为战役一的连续内存无锁队列
 #include "task.hpp"
-#include "io_context.hpp"
-#include "io_awaiter.hpp"
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -54,14 +55,15 @@ public:
   explicit CoroutineScheduler(size_t queue_capacity = 65536,
                               int worker_cpu_id = -1,
                               unsigned int io_uring_entries = 1024)
-      : queue_(queue_capacity), io_context_(io_uring_entries), worker_cpu_id_(worker_cpu_id) {}
+      : queue_(queue_capacity), io_context_(io_uring_entries),
+        worker_cpu_id_(worker_cpu_id) {}
 
   ~CoroutineScheduler() { stop(); }
 
   // 暴露 IoContext，供 IoAwaiter 提交任务时使用
-  IoContext& get_io_context() { return io_context_; }
+  IoContext &get_io_context() { return io_context_; }
 
-  void start() {
+  void start(std::function<void()> on_worker_start = nullptr) {
     // 使用 release 语义，确保在此之前的初始化操作对 worker 线程可见
     running_.store(true, std::memory_order_release);
 
@@ -69,7 +71,12 @@ public:
     // 编译器会生成一个匿名的类，重载 operator()
     // 运行时，先实例化lambda，然后创建线程，将lambda作为参数传递给线程，
     // 线程启动后，调用lambda的operator()方法
-    worker_thread_ = std::thread([this]() { this->run_loop(); });
+    worker_thread_ = std::thread([this, on_worker_start]() {
+      if (on_worker_start) {
+        on_worker_start();
+      }
+      this->run_loop();
+    });
 
     // 【核心优化】：将 Worker 线程钉死在指定 CPU 核心上
     // 彻底消除 OS/Hypervisor 跨核迁移导致的缓存失效和调度抖动
@@ -124,7 +131,8 @@ private:
           active_tasks.push_back(std::move(current_task));
         }
 
-        // 重要：在处理完业务协程逻辑后，如果有新的 IO SQE 被填充，在这里 flush 进内核
+        // 重要：在处理完业务协程逻辑后，如果有新的 IO SQE 被填充，在这里 flush
+        // 进内核
         io_context_.submit();
 
       } else {
@@ -171,8 +179,9 @@ private:
         } else {
           // 阶段 3：真正的真空期。既没有计算任务，也没有立即可收割的 IO。
           // 此时调用阻塞的 io_context.wait_cqe 沉睡，让出核心。
-          io_context_.submit(); // 阻塞前确保提交所有堆积的 IO 请求 (任务 3.4 准备)
-          
+          io_context_
+              .submit(); // 阻塞前确保提交所有堆积的 IO 请求 (任务 3.4 准备)
+
           if (io_context_.wait_cqe(&cqe) == 0) {
             IoAwaiter *awaiter =
                 static_cast<IoAwaiter *>(io_uring_cqe_get_data(cqe));

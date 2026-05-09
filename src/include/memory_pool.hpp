@@ -1,126 +1,166 @@
 #pragma once
-#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdlib> // aligned_alloc / free
 #include <new>     // std::bad_alloc
 #include <vector>
 
-#if defined(__x86_64__) || defined(_M_X64)
-#include <immintrin.h>
+#ifndef MYIO_ENABLE_CORO_POOL
+#define MYIO_ENABLE_CORO_POOL 1
 #endif
 
-// ============================================================================
-// 极简自旋锁
-// ============================================================================
-class SpinLock {
-  std::atomic_flag flag_ = ATOMIC_FLAG_INIT;
-
-public:
-  void lock() noexcept {
-    while (flag_.test_and_set(std::memory_order_acquire)) {
-#if defined(__x86_64__) || defined(_M_X64)
-      _mm_pause();
-#endif
-    }
-  }
-  void unlock() noexcept { flag_.clear(std::memory_order_release); }
-};
-
-class SpinLockGuard {
-  SpinLock &lock_;
-
-public:
-  explicit SpinLockGuard(SpinLock &lock) : lock_(lock) { lock_.lock(); }
-  ~SpinLockGuard() { lock_.unlock(); }
-  SpinLockGuard(const SpinLockGuard &) = delete;
-  SpinLockGuard &operator=(const SpinLockGuard &) = delete;
+struct CoroutinePoolStats {
+  std::size_t pool_allocations = 0;
+  std::size_t fallback_allocations = 0;
+  std::size_t pool_deallocations = 0;
+  std::size_t fallback_deallocations = 0;
 };
 
 // ============================================================================
-// 协程帧内存池 —— 固定帧大小 + thread_local 裸指针缓存
+// 协程帧内存池 —— 固定帧大小 + 单所有者空闲链表（无锁、无 TLS）
+//
+// 设计原则：
+//  本引擎是单线程事件循环架构。协程帧的 new/delete 只发生在 Worker 线程中。
+//  外部生产者通过 MPSC 队列投递 Task 对象（轻量级 coroutine_handle 包装），
+//  它们从不触及内存池。因此不需要 thread_local 也不需要任何锁。
 //
 // 优化策略：
-//  - BLOCK_SIZE = 128B（协程帧实测 72B，128B 对齐且浪费最小）
-//  - 使用 __thread 裸变量代替 static thread_local class，
-//    避免 __tls_get_addr() 函数调用开销（GCC 动态 TLS 模型）
-//  - 全局池仅在批量补货/归还时触发自旋锁
+//  - BLOCK_SIZE = 128B（协程帧大多数在128B以内，128B 对齐且浪费最小）
+//  - 单所有者空闲链表：Worker 线程直接持有，零同步开销
+//  - 按需扩容：4MB Slab 批量分配，减少系统调用
 // ============================================================================
 
-// 使用裸 FreeBlock 指针做 thread_local 缓存，避免 static thread_local 的
-// __tls_get_addr 开销。GCC 对 POD 类型的 __thread 使用更快的 initial-exec TLS
-// 模型。
+// 空闲块节点：复用空闲内存的前 8 字节存放 next 指针（侵入式链表）
 struct PoolFreeBlock {
   PoolFreeBlock *next;
 };
 
-// 全局 Slab 管理器
+// 协程帧内存池 —— 单所有者设计
+// 由 Worker 线程独占使用，不需要任何同步机制
 class CoroutineMemoryPool {
   struct Slab {
     void *memory;
   };
 
-  static constexpr std::size_t BLOCK_BYTES = 128; // 覆盖常见协程帧(56~112B)，2×cache line 对齐
+  static constexpr std::size_t BLOCK_BYTES =
+      128; // 覆盖常见协程帧(56~112B)，2×cache line 对齐
   static constexpr std::size_t SLAB_BYTES = 4 << 20; // 4MB
   static constexpr std::size_t BLOCKS_PER_SLAB =
       SLAB_BYTES / BLOCK_BYTES; // 32768
-  static constexpr std::size_t REFILL_BATCH = 4096;
 
-  SpinLock lock_;
-  PoolFreeBlock *global_free_ = nullptr;
+  // 空闲链表头指针（Worker 线程独占，无需原子操作）
+  PoolFreeBlock *free_head_ = nullptr;
+
+  // 空闲块计数（用于监控/调试，非必需）
+  std::size_t free_count_ = 0;
+
+  CoroutinePoolStats stats_{};
+
+  // Slab 存储列表（用于析构时统一释放）
   std::vector<Slab> slabs_;
 
-  void grow_locked() {
+  // 扩容：
+  // 1. 分配一块 4MB、64 字节对齐的大内存（Slab）
+  // 2. 将 Slab 记录到 slabs_ 以便析构时统一释放
+  // 3. 将 Slab 切分为 BLOCKS_PER_SLAB (32768) 个 128B 的 FreeBlock，
+  //    逐个头插法插到空闲链表 free_head_ 中
+  void grow() {
     void *raw = std::aligned_alloc(64, SLAB_BYTES);
     if (!raw)
       throw std::bad_alloc();
     slabs_.push_back({raw});
 
+    // 把生内存转成char(1字节)，用来按字节偏移计算每个块的地址
     char *ptr = static_cast<char *>(raw);
     for (std::size_t i = 0; i < BLOCKS_PER_SLAB; ++i) {
       auto *block = reinterpret_cast<PoolFreeBlock *>(ptr + i * BLOCK_BYTES);
-      block->next = global_free_;
-      global_free_ = block;
+      block->next = free_head_;
+      free_head_ = block;
     }
-  }
-
-  PoolFreeBlock *take_batch_locked(std::size_t count) {
-    if (!global_free_)
-      grow_locked();
-    PoolFreeBlock *batch = global_free_;
-    PoolFreeBlock *tail = batch;
-    for (std::size_t i = 1; i < count && tail->next; ++i)
-      tail = tail->next;
-    global_free_ = tail->next;
-    tail->next = nullptr;
-    return batch;
-  }
-
-  void return_batch_locked(PoolFreeBlock *head, PoolFreeBlock *tail) {
-    tail->next = global_free_;
-    global_free_ = head;
+    free_count_ += BLOCKS_PER_SLAB;
   }
 
 public:
   CoroutineMemoryPool() = default;
+
+  // 析构函数：遍历所有已分配的 Slab，逐个 free 归还给操作系统。
   ~CoroutineMemoryPool() {
     for (auto &s : slabs_)
       std::free(s.memory);
   }
 
+  // 禁止拷贝和移动（单例语义）
+  CoroutineMemoryPool(const CoroutineMemoryPool &) = delete;
+  CoroutineMemoryPool &operator=(const CoroutineMemoryPool &) = delete;
+
+  // 返回单个内存块的字节大小（128B）
   static constexpr std::size_t block_size() { return BLOCK_BYTES; }
-  static constexpr std::size_t refill_batch() { return REFILL_BATCH; }
 
-  PoolFreeBlock *refill(std::size_t count) {
-    SpinLockGuard guard(lock_);
-    return take_batch_locked(count);
+  // 分配一个协程帧内存块：
+  // 1. 超大帧回退：若请求大小超过 BLOCK_BYTES (128B)，直接走全局 operator new
+  // 2. 快路径：若空闲链表非空，O(1) 弹出头节点返回
+  // 3. 慢路径：空闲链表耗尽，分配新的 4MB Slab 扩容，再弹出一个返回
+  void *allocate(std::size_t size) {
+#if !MYIO_ENABLE_CORO_POOL
+    stats_.fallback_allocations++;
+    return ::operator new(size);
+#else
+    if (size > BLOCK_BYTES) [[unlikely]] {
+      stats_.fallback_allocations++;
+      return ::operator new(size);
+    }
+
+    // 快路径：空闲链表有空闲块
+    if (free_head_) [[likely]] {
+      PoolFreeBlock *b = free_head_;
+      free_head_ = b->next;
+      free_count_--;
+      stats_.pool_allocations++;
+      return b;
+    }
+
+    // 慢路径：空闲链表空了，扩容
+    grow();
+
+    PoolFreeBlock *b = free_head_;
+    free_head_ = b->next;
+    free_count_--;
+    stats_.pool_allocations++;
+    return b;
+#endif
   }
 
-  void return_blocks(PoolFreeBlock *head, PoolFreeBlock *tail) {
-    SpinLockGuard guard(lock_);
-    return_batch_locked(head, tail);
+  // 释放一个协程帧内存块：
+  // 1. 超大帧回退：若 size 超过 BLOCK_BYTES，走全局 operator delete
+  // 2. 正常路径：将释放的块头插到空闲链表，O(1) 完成
+  void deallocate(void *ptr, std::size_t size) {
+#if !MYIO_ENABLE_CORO_POOL
+    stats_.fallback_deallocations++;
+    ::operator delete(ptr);
+#else
+    if (size > BLOCK_BYTES) [[unlikely]] {
+      stats_.fallback_deallocations++;
+      ::operator delete(ptr);
+      return;
+    }
+
+    auto *b = static_cast<PoolFreeBlock *>(ptr);
+    b->next = free_head_;
+    free_head_ = b;
+    free_count_++;
+    stats_.pool_deallocations++;
+#endif
   }
 
+  // 获取当前空闲块数量（调试用）
+  std::size_t free_count() const { return free_count_; }
+
+  const CoroutinePoolStats &stats() const { return stats_; }
+  void reset_stats() { stats_ = {}; }
+
+  // 全局单例访问（保留 Meyers' Singleton，保证生命周期安全）
+  // 虽然在单线程中 static 初始化的线程安全保证不是必需的，
+  // 但 Singleton 模式本身解决的是生命周期问题，不是线程安全问题。
   static CoroutineMemoryPool &get_instance() {
     static CoroutineMemoryPool pool;
     return pool;
@@ -128,54 +168,23 @@ public:
 };
 
 // ============================================================================
-// 内联分配/释放函数 —— 直接使用 thread_local 裸变量做缓存
+// 内联分配/释放函数 —— 直接转发到全局单例
 // ============================================================================
-inline thread_local PoolFreeBlock *tl_pool_head_ = nullptr;
-inline thread_local std::size_t tl_pool_count_ = 0;
 
+// 内存分配入口（由协程 promise_type::operator new 调用）
 inline void *pool_allocate(std::size_t size) {
-  if (size > CoroutineMemoryPool::block_size()) [[unlikely]]
-    return ::operator new(size);
-
-  if (tl_pool_head_) [[likely]] {
-    PoolFreeBlock *b = tl_pool_head_;
-    tl_pool_head_ = b->next;
-    tl_pool_count_--;
-    return b;
-  }
-
-  // 慢速路径：批量补货
-  auto &pool = CoroutineMemoryPool::get_instance();
-  tl_pool_head_ = pool.refill(CoroutineMemoryPool::refill_batch());
-  tl_pool_count_ = CoroutineMemoryPool::refill_batch();
-
-  PoolFreeBlock *b = tl_pool_head_;
-  tl_pool_head_ = b->next;
-  tl_pool_count_--;
-  return b;
+  return CoroutineMemoryPool::get_instance().allocate(size);
 }
 
+// 内存释放入口（由协程 promise_type::operator delete 调用）
 inline void pool_deallocate(void *ptr, std::size_t size) {
-  if (size > CoroutineMemoryPool::block_size()) [[unlikely]] {
-    ::operator delete(ptr);
-    return;
-  }
+  CoroutineMemoryPool::get_instance().deallocate(ptr, size);
+}
 
-  auto *b = static_cast<PoolFreeBlock *>(ptr);
-  b->next = tl_pool_head_;
-  tl_pool_head_ = b;
-  tl_pool_count_++;
+inline const CoroutinePoolStats &pool_stats() {
+  return CoroutineMemoryPool::get_instance().stats();
+}
 
-  // 积攒过多时归还一半
-  constexpr std::size_t threshold = CoroutineMemoryPool::refill_batch() * 4;
-  if (tl_pool_count_ > threshold) [[unlikely]] {
-    std::size_t ret = tl_pool_count_ / 2;
-    PoolFreeBlock *head = tl_pool_head_;
-    PoolFreeBlock *tail = head;
-    for (std::size_t i = 1; i < ret; ++i)
-      tail = tail->next;
-    tl_pool_head_ = tail->next;
-    tl_pool_count_ -= ret;
-    CoroutineMemoryPool::get_instance().return_blocks(head, tail);
-  }
+inline void reset_pool_stats() {
+  CoroutineMemoryPool::get_instance().reset_stats();
 }

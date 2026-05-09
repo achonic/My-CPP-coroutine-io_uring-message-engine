@@ -39,6 +39,7 @@ struct IoAwaiter {
   // std::coroutine_handle<> handle 传入的是外部协程的句柄
   void await_suspend(std::coroutine_handle<> handle) noexcept {
     handle_ = handle;
+    // 提交队列提供一个可写位置
     struct io_uring_sqe *sqe = ctx_.get_sqe();
 
     // 根据 opcode 初始化不同的 IO 操作( read/write/accpet )
