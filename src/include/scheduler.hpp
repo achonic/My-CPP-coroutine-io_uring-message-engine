@@ -97,7 +97,11 @@ public:
   // 【极速入口】：前端业务线程（或其他 Worker）通过这里无锁投递任务
   bool submit(Task<int> task) {
     // 将 Task 的所有权彻底 Move 进无锁队列的槽位中
-    return queue_.push(std::move(task));
+    if (queue_.push(std::move(task))) {
+      io_context_.notify_wakeup();
+      return true;
+    }
+    return false;
   }
 
 private:
@@ -109,40 +113,29 @@ private:
     std::vector<Task<int>>
         active_tasks; // 任务活跃池，用于防止顶层协程挂起时被析构
 
+    io_context_.prepare_wakeup_read();
+    io_context_.submit();
+
     while (running_.load(std::memory_order_relaxed)) {
-      // 检查是否有已经完成的任务需要回收
       if (!active_tasks.empty()) {
-        // erase-remove_if 的用法
-        // remove_if 把已经done的任务移到vector的末尾，返回新的尾部迭代器
-        // erase 删除从新尾部迭代器到原末尾的所有元素
         active_tasks.erase(
             std::remove_if(active_tasks.begin(), active_tasks.end(),
                            [](const auto &t) { return t.get_handle().done(); }),
             active_tasks.end());
       }
 
-      // 尝试从无锁队列中剥离出一个协程任务
-      if (queue_.pop(current_task)) {
-        idle_spin_count = 0; // 拿到任务，重置空转计数
+      bool did_work = false;
 
-        // 唤醒底层的协程状态机
-        if (current_task.resume()) {
-          // 如果协程挂起（未结束），将其移交给 active_tasks 维持生命周期
-          active_tasks.push_back(std::move(current_task));
-        }
+      struct io_uring_cqe *cqe;
+      while (io_context_.peek_cqe(&cqe) == 0) {
+        did_work = true;
+        void *user_data = io_uring_cqe_get_data(cqe);
 
-        // 重要：在处理完业务协程逻辑后，如果有新的 IO SQE 被填充，在这里 flush
-        // 进内核
-        io_context_.submit();
-
-      } else {
-        // 尝试从 io_uring 收割完成的 IO 事件 (策略 A & 任务 3.3)
-        struct io_uring_cqe *cqe;
-        bool has_io = false;
-        while (io_context_.peek_cqe(&cqe) == 0) {
-          has_io = true;
-          IoAwaiter *awaiter =
-              static_cast<IoAwaiter *>(io_uring_cqe_get_data(cqe));
+        if (user_data == io_context_.wakeup_token_ptr()) {
+          io_context_.cqe_seen(cqe);
+          io_context_.prepare_wakeup_read();
+        } else {
+          IoAwaiter *awaiter = static_cast<IoAwaiter *>(user_data);
           if (awaiter) {
             awaiter->result_ = cqe->res;
             io_context_.cqe_seen(cqe);
@@ -151,54 +144,56 @@ private:
             io_context_.cqe_seen(cqe);
           }
         }
+      }
 
-        if (has_io) {
-          idle_spin_count = 0;
-          io_context_.submit(); // 确保刚产生的新 IO 进入内核
-          continue; // 只要有 IO 完成，就认为系统在忙碌，继续下一轮循环
+      if (queue_.pop(current_task)) {
+        did_work = true;
+        if (current_task.resume()) {
+          active_tasks.push_back(std::move(current_task));
         }
+      }
 
-        // 没有任务就自增空转计数
-        // 【关键改造】：自适应退避策略 (Exponential Backoff)
-        // 遇到真空期，绝对不能调用 yield() 陷入内核态！
+      if (did_work) {
+        idle_spin_count = 0;
+        io_context_.submit();
+      } else {
         idle_spin_count++;
 
         if (idle_spin_count < 1000) {
-// 阶段 1：极度活跃期。只调用硬件级的 pause 指令。
-// 这会让 CPU 稍微歇一口气，清空流水线，但不会触发线程切换。
 #if defined(__x86_64__) || defined(_M_X64)
           _mm_pause();
 #endif
         } else if (idle_spin_count < 10000) {
-          // 阶段 2：轻度空闲期。执行多次 pause，进一步降低总线占用。
           for (int i = 0; i < 10; ++i) {
 #if defined(__x86_64__) || defined(_M_X64)
             _mm_pause();
 #endif
           }
         } else {
-          // 阶段 3：真正的真空期。既没有计算任务，也没有立即可收割的 IO。
-          // 此时调用阻塞的 io_context.wait_cqe 沉睡，让出核心。
-          io_context_
-              .submit(); // 阻塞前确保提交所有堆积的 IO 请求 (任务 3.4 准备)
+          io_context_.submit();
 
           if (io_context_.wait_cqe(&cqe) == 0) {
-            IoAwaiter *awaiter =
-                static_cast<IoAwaiter *>(io_uring_cqe_get_data(cqe));
-            if (awaiter) {
-              awaiter->result_ = cqe->res;
+            void *user_data = io_uring_cqe_get_data(cqe);
+            if (user_data == io_context_.wakeup_token_ptr()) {
               io_context_.cqe_seen(cqe);
-              awaiter->handle_.resume();
+              io_context_.prepare_wakeup_read();
             } else {
-              io_context_.cqe_seen(cqe);
+              IoAwaiter *awaiter = static_cast<IoAwaiter *>(user_data);
+              if (awaiter) {
+                awaiter->result_ = cqe->res;
+                io_context_.cqe_seen(cqe);
+                awaiter->handle_.resume();
+              } else {
+                io_context_.cqe_seen(cqe);
+              }
             }
             idle_spin_count = 0;
+            io_context_.submit();
           }
         }
       }
     }
 
-    // 调度器被 stop 后，优雅地清空队列里的残余任务
     while (queue_.pop(current_task)) {
       current_task.resume();
     }
